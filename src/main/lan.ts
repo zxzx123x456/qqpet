@@ -5,6 +5,7 @@
 
 import { createSocket, type Socket as UdpSocket } from 'node:dgram'
 import { createServer, connect, type Server, type Socket as TcpSocket } from 'node:net'
+import { networkInterfaces } from 'node:os'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
@@ -34,6 +35,20 @@ export function persistedLanId(dir: string): string {
 }
 
 const line = (o: unknown): string => `${JSON.stringify(o)}\n`
+
+/** Each adapter's own broadcast address; the limited broadcast misses VPN adapters. */
+function broadcastAddrs(): string[] {
+  const out: string[] = []
+  for (const addrs of Object.values(networkInterfaces())) {
+    for (const a of addrs ?? []) {
+      if (a.family !== 'IPv4' || a.internal) continue
+      const ip = a.address.split('.').map(Number)
+      const mask = a.netmask.split('.').map(Number)
+      out.push(ip.map((o, i) => o | (~mask[i]! & 0xff)).join('.'))
+    }
+  }
+  return out
+}
 
 export interface LanHandlers {
   online?: (peer: LanPeer) => void
@@ -140,7 +155,19 @@ export class LanNode {
 
   private hello(): void {
     const pkt: LanLine = { t: 'hello', v: 1, tcp: this.tcpPort, ...this.me }
-    this.udp?.send(line(pkt), UDP_PORT, '255.255.255.255')
+    const data = line(pkt)
+    const udp = this.udp
+    if (!udp) return
+    const to = (addr: string): void => {
+      udp.send(data, UDP_PORT, addr, () => {})
+    }
+    // The limited broadcast leaves through the default route's adapter, which may
+    // not be the VPN the friend sits on: repeat on every adapter's own broadcast.
+    to('255.255.255.255')
+    for (const b of broadcastAddrs()) to(b)
+    // Known friends also get it by unicast: a broadcast may drop, ping-grade
+    // unicast keeps the presence steady and fills a one-way discovery in reverse.
+    for (const { peer } of this.peers.values()) to(peer.addr)
   }
 
   private onDatagram(buf: Buffer, addr: string): void {
@@ -152,7 +179,7 @@ export class LanNode {
     }
     if (!('id' in pkt) || pkt.id === this.me.id) return
     if (pkt.t === 'bye') {
-      this.drop(pkt.id, addr)
+      this.drop(pkt.id)
       return
     }
     if (pkt.t !== 'hello') return
@@ -177,9 +204,11 @@ export class LanNode {
     }
   }
 
-  private drop(id: string, addr: string): void {
+  private drop(id: string): void {
     const seen = this.peers.get(id)
-    if (!seen || seen.peer.addr !== addr) return
+    if (!seen) return
+    // The same friend arrives over several adapters, so a goodbye may come in on
+    // a different path than the last hello: trust the id alone.
     this.peers.delete(id)
     this.links.get(id)?.destroy()
     this.links.delete(id)
